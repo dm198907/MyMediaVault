@@ -156,7 +156,7 @@ function parseLine(line) {
   if(!path) return null;
   const ext=path.split(".").pop().toLowerCase();
   if(!MEDIA_EXT.has(ext)) return null;
-  const fn=path.split('/').pop();
+  const fn=path.split(/[\/\\]/).pop();
   return {size,path,ext,quality:parseQuality(fn),audio:parseAudio(fn),codec:parseVideoCodec(fn)};
 }
 
@@ -189,14 +189,14 @@ function parseFiles(text) {
     if(SUB_EXT.has(f.ext)){
       subFiles.add(f.path);
       // Try to link subtitle to episode
-      const fn=f.path.split('/').pop();
+      const fn=f.path.split(/[\/\\]/).pop();
       const ep=parseEpisode(fn);
       const show=deriveShow(f.path);
       if(ep) subMap[`${show}:S${ep.season}E${ep.episode}`]=true;
       continue;
     }
     totalFiles++; if(f.size)totalSize+=f.size;
-    const ep=parseEpisode(f.path.split('/').pop());
+    const ep=parseEpisode(f.path.split(/[\/\\]/).pop());
     if(ep){
       const show=deriveShow(f.path);
       if(!shows[show])shows[show]={name:show,episodes:[],size:0};
@@ -221,7 +221,7 @@ function parseFiles(text) {
       const sn=parseInt(s,10);
       seasons.push({season:sn,have:epSet,count:epSet.size,max:Math.max(...epSet),min:Math.min(...epSet)});
     }
-    seasons.sort((a,b)=>a.season-b.season);
+    (seasons||[]).sort((a,b)=>a.season-b.season);
     // Quality summary for show
     const qualities=[...new Set(show.episodes.map(e=>e.quality).filter(Boolean))];
     const audios=[...new Set(show.episodes.map(e=>e.audio).filter(Boolean))];
@@ -235,6 +235,75 @@ function parseFiles(text) {
 }
 
 // ─── OMDb ─────────────────────────────────────────────────────────────────────
+
+// ─── TMDB API ─────────────────────────────────────────────────────────────────
+const TMDB = "https://api.themoviedb.org/3";
+async function tmdbGet(endpoint, params, key) {
+  try {
+    const url = `${TMDB}${endpoint}?api_key=${encodeURIComponent(key)}&${new URLSearchParams(params)}`;
+    const r = await fetch(url); if(!r.ok) return null;
+    return r.json();
+  } catch { return null; }
+}
+async function tmdbSearch(title, type, key) {
+  const d = await tmdbGet(`/search/${type}`, {query:title,page:1}, key);
+  return d?.results?.[0] || null;
+}
+function tmdbToOmdb(data, type) {
+  const isShow = type === "tv";
+  return {
+    Title:        isShow ? data.name : data.title,
+    Year:         (isShow ? data.first_air_date : data.release_date)?.slice(0,4) || "N/A",
+    Poster:       data.poster_path ? `https://image.tmdb.org/t/p/w500${data.poster_path}` : "N/A",
+    Plot:         data.overview || "N/A",
+    Genre:        data.genres?.map(g=>g.name).slice(0,3).join(", ") || "N/A",
+    imdbRating:   data.vote_average ? data.vote_average.toFixed(1) : "N/A",
+    imdbID:       data.external_ids?.imdb_id || null,
+    totalSeasons: data.number_of_seasons?.toString() || "N/A",
+    totalEpisodes:data.number_of_episodes || null,
+    Runtime:      data.episode_run_time?.[0] ? `${data.episode_run_time[0]} min` : (data.runtime ? `${data.runtime} min` : "N/A"),
+    Actors:       data.credits?.cast?.slice(0,3).map(c=>c.name).join(", ") || "N/A",
+    Type:         isShow ? "series" : "movie",
+    _source:      "tmdb",
+    _tmdbId:      data.id,
+  };
+}
+async function tmdbEnrichShow(tmdbId, seasons, key) {
+  const [detail, extIds, credits] = await Promise.all([
+    tmdbGet(`/tv/${tmdbId}`, {}, key),
+    tmdbGet(`/tv/${tmdbId}/external_ids`, {}, key),
+    tmdbGet(`/tv/${tmdbId}/credits`, {}, key),
+  ]);
+  if(!detail) return null;
+  detail.external_ids = extIds; detail.credits = credits;
+  const base = tmdbToOmdb(detail, "tv");
+  const seasonData = {};
+  for(const s of seasons) {
+    await sleep(120);
+    const sd = await tmdbGet(`/tv/${tmdbId}/season/${s.season}`, {}, key);
+    if(sd?.episodes) {
+      seasonData[s.season] = {
+        Season: s.season.toString(), Title: detail.name,
+        totalSeasons: detail.number_of_seasons?.toString(),
+        Episodes: sd.episodes.map(e=>({
+          Title: e.name, Episode: e.episode_number.toString(),
+          imdbRating: e.vote_average ? e.vote_average.toFixed(1) : "N/A",
+        }))
+      };
+    }
+  }
+  return {...base, seasonData};
+}
+async function tmdbEnrichMovie(tmdbId, key) {
+  const [detail, extIds, credits] = await Promise.all([
+    tmdbGet(`/movie/${tmdbId}`, {}, key),
+    tmdbGet(`/movie/${tmdbId}/external_ids`, {}, key),
+    tmdbGet(`/movie/${tmdbId}/credits`, {}, key),
+  ]);
+  if(!detail) return null;
+  detail.external_ids = extIds; detail.credits = credits;
+  return tmdbToOmdb(detail, "movie");
+}
 async function omdbRaw(p,k){const r=await fetch(`https://www.omdbapi.com/?apikey=${encodeURIComponent(k)}&${new URLSearchParams(p)}`);if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.json();}
 async function omdbGet(p,k){const d=await omdbRaw(p,k);if(d.Response==="False")return null;return d;}
 
@@ -510,10 +579,9 @@ const QualityBadge = ({q}) => {
 const DetailPanel = ({ item, type, overrides, onClose, onEnrich, onEnrichAnime, onSaveOverride, onClearOverride, onFetchById, apiKey }) => {
   const o = item.omdb;
   const isShow = type==="series";
-  if(isShow && !item.seasons) return null;
   const isAnime = item.isAnime || o?._source==="anilist";
 
-  const seasonDetails = isShow ? item.seasons.map(s => {
+  const seasonDetails = isShow ? (item.seasons||[]).map(s => {
     const od=o?.seasonData?.[s.season];
     let allEps=od?.Episodes
       ?od.Episodes.map(e=>({num:parseInt(e.Episode,10),title:e.Title}))
@@ -546,6 +614,10 @@ const DetailPanel = ({ item, type, overrides, onClose, onEnrich, onEnrichAnime, 
               :<div className="detail-poster-ph">▤</div>}
             <div className="detail-title-block">
               <div className="detail-name">{o?.Title||item.name||item.path.split('/').pop()}</div>
+              <div style={{fontFamily:"IBM Plex Mono",fontSize:".58rem",color:"#ffffff35",marginBottom:3,wordBreak:"break-all",display:"flex",alignItems:"center",gap:6,flexWrap:"wrap"}}>
+                <span>📁 {isShow ? item.name : (item.path||"").split("/").slice(0,-1).join("/")||item.path}</span>
+                {o?._source&&<span style={{padding:"1px 5px",borderRadius:2,fontSize:".58rem",background:o._source==="tmdb"?"#01b4e420":o._source==="anilist"?"#02a9ff20":"#f5c51820",color:o._source==="tmdb"?"#01b4e4":o._source==="anilist"?"#02a9ff":"#f5c518",border:"1px solid currentColor",opacity:.8}}>{o._source.toUpperCase()}</span>}
+              </div>
               <div style={{fontSize:".78rem",color:"#ffffff60",marginBottom:4}}>{o?.Genre||""}</div>
               <div className="detail-chips">
                 {o?.Year&&<span className="dchip">{o.Year}</span>}
@@ -594,6 +666,7 @@ const DetailPanel = ({ item, type, overrides, onClose, onEnrich, onEnrichAnime, 
           {/* Links */}
           <div className="detail-links">
             {o?.imdbID&&<a className="imdb-badge" href={`https://www.imdb.com/title/${o.imdbID}`} target="_blank" rel="noreferrer">IMDb</a>}
+            {o?._tmdbId&&<a href={`https://www.themoviedb.org/${type==="series"?"tv":"movie"}/${o._tmdbId}`} target="_blank" rel="noreferrer" style={{background:"#01b4e4",color:"#000",fontFamily:"IBM Plex Mono",fontWeight:700,fontSize:".65rem",padding:"2px 7px",borderRadius:2,textDecoration:"none"}}>TMDB</a>}
             {o?.anilistUrl&&<a className="anilist-badge" href={o.anilistUrl} target="_blank" rel="noreferrer">AniList</a>}
             {o?.Metascore&&o.Metascore!=="N/A"&&<span style={{fontFamily:"IBM Plex Mono",fontSize:".7rem",color:"var(--blue)"}}>Metascore: {o.Metascore}</span>}
             {o?.Actors&&o.Actors!=="N/A"&&<span style={{fontFamily:"IBM Plex Mono",fontSize:".7rem",color:"var(--text3)",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",maxWidth:300}}>{o.Actors}</span>}
@@ -753,6 +826,8 @@ const DbInspector = ({ dbStats, onRefresh }) => {
 export default function App() {
   const [text,      setText]      = useState(SAMPLE);
   const [apiKey,    setApiKey]    = useState("");
+  const [tmdbKey,   setTmdbKey]   = useState("");
+  const [tmdbStatus,setTmdbStatus]= useState("idle");
   const [apiStatus, setApiStatus] = useState("idle");
   const [apiError,  setApiError]  = useState("");
   const [shows,     setShows]     = useState([]);
@@ -793,6 +868,8 @@ export default function App() {
     (async()=>{
       await refreshDbStats();
       const key=await db.getSetting("apikey");
+      const tkey=await db.getSetting("tmdbkey");
+      if(tkey) setTmdbKey(tkey);
       if(key) setApiKey(key);
       const savedTheme=await db.getSetting("theme");
       if(savedTheme&&THEMES[savedTheme]) setTheme(savedTheme);
@@ -814,7 +891,7 @@ export default function App() {
         });
         const enrichedMovies=d.movies.map(movie=>{
           const ovrEntry=o[movie.path];
-          const fn=(movie.path||"").split("/").pop().replace(/\.[^.]+$/,"");
+          const fn=((movie.path||"").split("/").pop()||"").replace(/\.[^.]+$/,"");
           const clean=fn.replace(/\s*\(\d{4}\)/,"").replace(/[._]/g," ").trim();
           const ck=ovrEntry?.imdbId||`title:movie:${clean.toLowerCase()}`;
           const omdbData=c[ck]||(ovrEntry?c[ovrEntry.imdbId]:null);
@@ -828,6 +905,7 @@ export default function App() {
   },[]);
 
   useEffect(()=>{if(apiKey)db.saveSetting("apikey",apiKey);},[apiKey]);
+  useEffect(()=>{if(tmdbKey)db.saveSetting("tmdbkey",tmdbKey);},[tmdbKey]);
   useEffect(()=>{db.saveSetting("theme",theme);},[theme]);
 
   // ── fetch by imdbId ───────────────────────────────────────────────────────
@@ -875,7 +953,7 @@ export default function App() {
 
   // ── enrich show ───────────────────────────────────────────────────────────
   const enrichShow = useCallback(async(name)=>{
-    if(!apiKey) return;
+    if(!apiKey && !tmdbKey) return;
     const ovr=await db.getOverrides();
     if(ovr?.[name]?.imdbId){await fetchById(name,ovr[name].imdbId,"series");return;}
     setShows(prev=>prev.map(s=>s.name===name?{...s,omdbStatus:"loading"}:s));
@@ -883,6 +961,11 @@ export default function App() {
     try{
       let res=await db.getCacheOne(ck);
       if(!res){res=await omdbGet({t:name,type:"series"},apiKey);setReqCount(c=>c+1);if(res){await db.saveCache(ck,res);await db.saveCache(res.imdbID,res);}}
+      // TMDB fallback
+      if(!res && tmdbKey){
+        const tr=await tmdbSearch(name,"tv",tmdbKey);
+        if(tr){const show=shows.find(s=>s.name===name);res=await tmdbEnrichShow(tr.id,show?.seasons||[],tmdbKey);if(res)await db.saveCache(ck,res);}
+      }
       if(!res){setShows(prev=>prev.map(s=>s.name===name?{...s,omdbStatus:"done"}:s));return;}
       const show=shows.find(s=>s.name===name);
       const seasonData={};
@@ -899,7 +982,7 @@ export default function App() {
 
   const enrichMovie = useCallback(async(movie)=>{
     if(!apiKey||movie.omdb) return;
-    const fn=(movie.path||"").split("/").pop().replace(/\.[^.]+$/,"");
+    const fn=((movie.path||"").split("/").pop()||"").replace(/\.[^.]+$/,"");
     const clean=fn.replace(/\s*\(\d{4}\)/,"").replace(/[._]/g," ").trim();
     const year=fn.match(/\((\d{4})\)/)?.[1];
     const ovr=await db.getOverrides();
@@ -909,6 +992,11 @@ export default function App() {
       const params=ovr?.[movie.path]?.imdbId?{i:ovr[movie.path].imdbId}:{t:clean,type:"movie",...(year?{y:year}:{})};
       res=await omdbGet(params,apiKey);setReqCount(c=>c+1);
       if(res){await db.saveCache(ck,res);await db.saveCache(res.imdbID,res);}
+    }
+    // TMDB fallback
+    if(!res && tmdbKey){
+      const tr=await tmdbSearch(clean,"movie",tmdbKey);
+      if(tr){res=await tmdbEnrichMovie(tr.id,tmdbKey);if(res)await db.saveCache(ck,res);}
     }
     if(res)setMovies(prev=>prev.map(m=>m.path===movie.path?{...m,omdb:res}:m));
   },[apiKey]);
@@ -930,7 +1018,7 @@ export default function App() {
     });
     const enrichedMovies=d.movies.map(movie=>{
       const ovrEntry=o[movie.path];
-      const fn=(movie.path||"").split("/").pop().replace(/\.[^.]+$/,"");
+      const fn=((movie.path||"").split("/").pop()||"").replace(/\.[^.]+$/,"");
       const clean=fn.replace(/\s*\(\d{4}\)/,"").replace(/[._]/g," ").trim();
       const ck=ovrEntry?.imdbId||`title:movie:${clean.toLowerCase()}`;
       const omdbData=c[ck]||(ovrEntry?c[ovrEntry.imdbId]:null);
@@ -973,7 +1061,7 @@ export default function App() {
 
   // ── computed ──────────────────────────────────────────────────────────────
   const totalMissing=useMemo(()=>shows.reduce((sum,sh)=>{
-    let m=0;for(const s of sh.seasons){const od=sh.omdb?.seasonData?.[s.season];if(od?.Episodes)m+=od.Episodes.length-s.count;}
+    let m=0;for(const s of (sh.seasons||[])){const od=sh.omdb?.seasonData?.[s.season];if(od?.Episodes)m+=od.Episodes.length-s.count;}
     return sum+m;
   },0),[shows]);
 
@@ -982,8 +1070,8 @@ export default function App() {
   const filtered=useMemo(()=>{
     let list=shows;
     if(search){const q=search.toLowerCase();list=list.filter(s=>s.name.toLowerCase().includes(q)||(s.omdb?.Title||"").toLowerCase().includes(q));}
-    if(filter==="missing")list=list.filter(s=>{let m=0;for(const ss of s.seasons){const od=s.omdb?.seasonData?.[ss.season];if(od?.Episodes)m+=od.Episodes.length-ss.count;}return m>0;});
-    if(filter==="complete")list=list.filter(s=>{let m=0;for(const ss of s.seasons){const od=s.omdb?.seasonData?.[ss.season];if(od?.Episodes)m+=od.Episodes.length-ss.count;}return m===0&&s.omdb;});
+    if(filter==="missing")list=list.filter(s=>{let m=0;for(const ss of (s.seasons||[])){const od=s.omdb?.seasonData?.[ss.season];if(od?.Episodes)m+=od.Episodes.length-ss.count;}return m>0;});
+    if(filter==="complete")list=list.filter(s=>{let m=0;for(const ss of (s.seasons||[])){const od=s.omdb?.seasonData?.[ss.season];if(od?.Episodes)m+=od.Episodes.length-ss.count;}return m===0&&s.omdb;});
     if(filter==="dupes")list=list.filter(s=>s.duplicates?.length>0);
     if(filter==="anime")list=list.filter(s=>s.isAnime||s.omdb?._source==="anilist");
     return[...list].sort((a,b)=>{
@@ -1021,14 +1109,14 @@ export default function App() {
   // ── ShowTile ──────────────────────────────────────────────────────────────
   const ShowTile=({show})=>{
     const o=show.omdb;const status=show.omdbStatus;
-    let miss=0;for(const s of show.seasons){const od=o?.seasonData?.[s.season];if(od?.Episodes)miss+=od.Episodes.length-s.count;}
+    let miss=0;for(const s of (show.seasons||[])){const od=o?.seasonData?.[s.season];if(od?.Episodes)miss+=od.Episodes.length-s.count;}
     const totalEps=o?.totalEpisodes||0;
     const progressPct=totalEps>0?Math.min(100,Math.round(show.episodeCount/totalEps*100)):null;
     const hasOvr=!!overrides[show.name];
     const isDup=show.duplicates?.length>0;
     const isAnime=show.isAnime||o?._source==="anilist";
-    const qualities=[...new Set((show.episodes||[]).map(e=>e.quality).filter(Boolean))];
-    const hasSubs=(show.seasons||[]).some(s=>[...(s.have||[])].some(ep=>subMap[`${show.name}:S${s.season}E${ep}`]));
+    const qualities=[...new Set((show.episodes||[]).map(e=>e?.quality).filter(Boolean))];
+    const hasSubs=((show.seasons)||[]).some(s=>[...Array.from(s.have||new Set())].some(ep=>subMap[`${show.name}:S${s.season}E${ep}`]));
 
     return(
       <div className={`tile ${view==="wall"?"wall":""}`} onClick={()=>setSelected({item:show,type:"series"})}>
@@ -1074,7 +1162,7 @@ export default function App() {
   // ── MovieTile ─────────────────────────────────────────────────────────────
   const MovieTile=({movie})=>{
     const o=movie.omdb;
-    const fn=(movie.path||"").split("/").pop().replace(/\.[^.]+$/,"");
+    const fn=((movie.path||"").split("/").pop()||"").replace(/\.[^.]+$/,"");
     const hasOvr=!!overrides[movie.path];
     const year=o?.Year||fn.match(/\((\d{4})\)/)?.[1];
     const decade=year?`${Math.floor(parseInt(year)/10)*10}s`:null;
@@ -1142,6 +1230,17 @@ export default function App() {
             {apiStatus==="ok"?"● connected":apiStatus==="err"?"✗ invalid":"○ unverified"}
           </span>
           <a href="https://www.omdbapi.com/apikey.aspx" target="_blank" rel="noreferrer" style={{fontFamily:"IBM Plex Mono",fontSize:".65rem",color:"var(--accent2)",textDecoration:"none"}}>get key →</a>
+        </div>
+        {/* TMDB Key */}
+        <div className="apibar">
+          <span className="apibar-label"><span style={{background:"#01b4e4",color:"#000",fontFamily:"IBM Plex Mono",fontWeight:700,fontSize:".65rem",padding:"1px 5px",borderRadius:2}}>TMDB</span>KEY</span>
+          <input type="password" placeholder="TMDB API key — fallback when OMDb finds nothing…" value={tmdbKey}
+            onChange={e=>{setTmdbKey(e.target.value);setTmdbStatus("idle");}}
+            onBlur={async()=>{if(!tmdbKey)return;const d=await tmdbGet("/configuration",{},tmdbKey);setTmdbStatus(d?"ok":"err");}}/>
+          <span className={`apibar-st ${tmdbStatus==="ok"?"st-ok":tmdbStatus==="err"?"st-err":"st-idle"}`}>
+            {tmdbStatus==="ok"?"● connected":tmdbStatus==="err"?"✗ invalid":"○ unverified"}
+          </span>
+          <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noreferrer" style={{fontFamily:"IBM Plex Mono",fontSize:".65rem",color:"var(--accent2)",textDecoration:"none"}}>get key →</a>
         </div>
         {apiError&&<div className="err-msg">{apiError}</div>}
         {!dbOnline&&<div className="err-msg">⚠ SQLite server offline — run: <code>node server.js</code></div>}
