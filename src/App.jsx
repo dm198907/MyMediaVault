@@ -1,4 +1,5 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from "react";
+const BUILD = "28May2026 19:30";
 
 // ─── constants ────────────────────────────────────────────────────────────────
 const VIDEO_EXT = new Set(["mkv","mp4","avi","mov","wmv","m4v","ts","m2ts","mpg","mpeg"]);
@@ -52,8 +53,8 @@ async function anilistSearch(title) {
       Poster:     m.coverImage?.large || "N/A",
       Plot:       m.description?.replace(/<[^>]*>/g,"") || "N/A",
       Genre:      m.genres?.slice(0,3).join(", ") || "N/A",
-      totalSeasons:"1",
-      totalEpisodes: m.episodes,
+      totalSeasons: null,
+      totalEpisodes: null,
       imdbID:     null,
       anilistId:  m.id,
       anilistUrl: `https://anilist.co/anime/${m.id}`,
@@ -160,11 +161,27 @@ function parseLine(line) {
   return {size,path,ext,quality:parseQuality(fn),audio:parseAudio(fn),codec:parseVideoCodec(fn)};
 }
 
-function parseEpisode(fn) {
+// ─── extract season number from folder path (e.g. "Season 2", "S2") ──────────
+function extractSeasonFromPath(path) {
+  const parts = path.split(/[\/\\]/);
+  for (const part of parts) {
+    const m = part.match(/(?:[Ss]eason\s*|[Ss])(\d+)/);
+    if (m) return parseInt(m[1], 10);
+  }
+  return 1;
+}
+
+// ─── parse episode from filename; fullPath used to resolve anime season ───────
+function parseEpisode(fn, fullPath) {
+  // Standard SxxExx / S01E01
   const m1=fn.match(/[Ss](\d{1,2})\s*[._]?\s*[Ee](\d{1,3})/);
   if(m1) return {season:parseInt(m1[1],10),episode:parseInt(m1[2],10)};
-  const m2=fn.match(/(?:[-\s_])0*(\d{1,3})(?:\s*(?:\(|\[|_|-|$))/);
-  if(m2&&parseInt(m2[1],10)>0) return {season:1,episode:parseInt(m2[1],10)};
+  // Anime absolute episode — dot before extension now also accepted as boundary
+  const m2=fn.match(/(?:[-\s_])0*(\d{1,3})(?:\s*(?:\(|\[|_|-|\.|$))/);
+  if(m2&&parseInt(m2[1],10)>0) {
+    const season = fullPath ? extractSeasonFromPath(fullPath) : 1;
+    return {season, episode:parseInt(m2[1],10)};
+  }
   return null;
 }
 
@@ -190,13 +207,13 @@ function parseFiles(text) {
       subFiles.add(f.path);
       // Try to link subtitle to episode
       const fn=f.path.split(/[\/\\]/).pop();
-      const ep=parseEpisode(fn);
+      const ep=parseEpisode(fn, f.path);
       const show=deriveShow(f.path);
       if(ep) subMap[`${show}:S${ep.season}E${ep.episode}`]=true;
       continue;
     }
     totalFiles++; if(f.size)totalSize+=f.size;
-    const ep=parseEpisode(f.path.split(/[\/\\]/).pop());
+    const ep=parseEpisode(f.path.split(/[\/\\]/).pop(), f.path);
     if(ep){
       const show=deriveShow(f.path);
       if(!shows[show])shows[show]={name:show,episodes:[],size:0};
@@ -547,16 +564,39 @@ body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-ser
 `;
 
 // ─── ManualIdPanel ────────────────────────────────────────────────────────────
-const ManualIdPanel = ({ itemKey, overrides, onSave, onClear, apiKey, onFetch, type }) => {
+const ManualIdPanel = ({ itemKey, overrides, onSave, onClear, apiKey, onFetch, type, omdb, onEnrichAnime }) => {
   const saved = overrides[itemKey];
-  const [val, setVal] = useState(saved?.imdbId || "");
+  const [val, setVal]   = useState(saved?.imdbId || "");
+  const [aval, setAval] = useState("");
   const handleSave = async () => {
     const v=val.trim(); if(!v) return;
     await onSave(itemKey, v);
     if(apiKey) onFetch(itemKey, v, type);
   };
+  const handleAnilist = () => {
+    const id = parseInt(aval.trim());
+    if(!id) return;
+    onEnrichAnime && onEnrichAnime(itemKey, id);
+  };
+  const src = omdb?._source;
   return (
     <div className="mid-panel">
+      {/* Source badge */}
+      {omdb && (
+        <div style={{marginBottom:10,display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontFamily:"IBM Plex Mono",fontSize:".65rem",color:"var(--text3)"}}>SOURCE</span>
+          <span style={{padding:"2px 8px",borderRadius:3,fontSize:".65rem",fontFamily:"IBM Plex Mono",fontWeight:600,
+            background:src==="tmdb"?"#01b4e420":src==="anilist"?"#02a9ff20":"#f5c51820",
+            color:src==="tmdb"?"#01b4e4":src==="anilist"?"#02a9ff":"#f5c518",
+            border:"1px solid currentColor"}}>
+            {src?src.toUpperCase():"OMDB"}
+          </span>
+          {omdb?.imdbID&&<a href={`https://www.imdb.com/title/${omdb.imdbID}`} target="_blank" rel="noreferrer" style={{fontFamily:"IBM Plex Mono",fontSize:".65rem",color:"var(--text3)"}}>{omdb.imdbID} ↗</a>}
+          {omdb?.anilistUrl&&<a href={omdb.anilistUrl} target="_blank" rel="noreferrer" style={{fontFamily:"IBM Plex Mono",fontSize:".65rem",color:"#02a9ff"}}>AniList ↗</a>}
+          {omdb?.id&&<a href={`https://www.themoviedb.org/tv/${omdb.id}`} target="_blank" rel="noreferrer" style={{fontFamily:"IBM Plex Mono",fontSize:".65rem",color:"#01b4e4"}}>TMDB ↗</a>}
+        </div>
+      )}
+      {/* IMDb ID override */}
       <div className="mid-title">⊕ Manual IMDb ID</div>
       {saved && <div className="mid-saved">✓ {saved.imdbId} <button className="btn btn-d btn-sm" onClick={()=>{onClear(itemKey);setVal("");}}>clear</button></div>}
       <div className="mid-row">
@@ -564,6 +604,13 @@ const ManualIdPanel = ({ itemKey, overrides, onSave, onClear, apiKey, onFetch, t
         <button className="btn btn-y btn-sm" onClick={handleSave} disabled={!val.trim()}>{apiKey?"Save & Fetch":"Save"}</button>
       </div>
       <div className="mid-hint">imdb.com/title/<span style={{color:"var(--accent)"}}>tt0903747</span> · <a href="https://www.imdb.com/search/title/" target="_blank" rel="noreferrer" style={{color:"var(--text3)"}}>search →</a></div>
+      {/* AniList ID override — available for all shows */}
+      <div className="mid-title" style={{marginTop:12}}>⊕ Manual AniList ID</div>
+      <div className="mid-row">
+        <input value={aval} onChange={e=>setAval(e.target.value)} placeholder="e.g. 6702" onKeyDown={e=>e.key==="Enter"&&handleAnilist()}/>
+        <button className="btn btn-b btn-sm" onClick={handleAnilist} disabled={!aval.trim()}>Fetch AniList</button>
+      </div>
+      <div className="mid-hint">anilist.co/anime/<span style={{color:"var(--accent)"}}>6702</span> · <a href="https://anilist.co/search/anime" target="_blank" rel="noreferrer" style={{color:"var(--text3)"}}>search →</a></div>
     </div>
   );
 };
@@ -581,16 +628,62 @@ const DetailPanel = ({ item, type, overrides, onClose, onEnrich, onEnrichAnime, 
   const isShow = type==="series";
   const isAnime = item.isAnime || o?._source==="anilist";
 
-  const seasonDetails = isShow ? (item.seasons||[]).map(s => {
-    const od=o?.seasonData?.[s.season];
-    let allEps=od?.Episodes
-      ?od.Episodes.map(e=>({num:parseInt(e.Episode,10),title:e.Title}))
-      :Array.from({length:s.max-s.min+1},(_,i)=>({num:s.min+i}));
-    // For anilist, generate episode list from totalEpisodes
-    if(isAnime&&o?.totalEpisodes&&!od){
-      allEps=Array.from({length:o.totalEpisodes},(_,i)=>({num:i+1}));
+  // Sonarr-style absolute episode remapping:
+  // If local S01 has more eps than OMDb S01, files use absolute numbering.
+  // Remap e.g. S01E099 -> S02E01 using OMDb episode counts as offsets.
+  const omdbSeasonNums = Object.keys(o?.seasonData||{}).map(n=>parseInt(n,10)).sort((a,b)=>a-b);
+  let remappedHave = null;
+  if(omdbSeasonNums.length > 1 && o?.seasonData){
+    const absMap = {};
+    let abs = 1;
+    for(const sNum of omdbSeasonNums){
+      for(const ep of (o.seasonData[sNum]?.Episodes||[])){
+        absMap[abs++] = {season:sNum, episode:parseInt(ep.Episode,10)};
+      }
     }
-    return{season:s.season,have:s.have,allEps,missing:allEps.filter(e=>!s.have.has(e.num))};
+    const localS1 = (item.seasons||[]).find(x=>x.season===1);
+    const omdbS1Count = (o.seasonData[1]?.Episodes||[]).length;
+    const usesAbsolute = localS1 && localS1.have.size > omdbS1Count;
+    if(usesAbsolute){
+      remappedHave = {};
+      for(const ls of (item.seasons||[])){
+        for(const epNum of ls.have){
+          const mapped = absMap[epNum];
+          if(mapped){
+            if(!remappedHave[mapped.season]) remappedHave[mapped.season]=new Set();
+            remappedHave[mapped.season].add(mapped.episode);
+          }
+        }
+      }
+    }
+  }
+  const localSeasonNums = new Set((item.seasons||[]).map(s=>s.season));
+  const allSeasonNums   = [...new Set([...localSeasonNums,...omdbSeasonNums])].sort((a,b)=>a-b);
+
+  const seasonDetails = isShow ? allSeasonNums.map(sNum => {
+    const haveSet = remappedHave
+      ? (remappedHave[sNum] || new Set())
+      : ((item.seasons||[]).find(x=>x.season===sNum)?.have || new Set());
+    const s = (item.seasons||[]).find(x=>x.season===sNum)
+              || {season:sNum,have:new Set(),count:0,max:0,min:0};
+    const od = o?.seasonData?.[sNum];
+    let allEps = [];
+    if(od?.Episodes?.length > 0){
+      // Normalize OMDb absolute ep numbers to 1-based per season
+      // BUT only when local files also use relative (1-based) numbering.
+      // e.g. Fairy Tail S02 local=E01-E24, OMDb=E49-E96 -> offset=48
+      // e.g. Fairy Tail S09 local=E278-E328, OMDb=E278-E328 -> no offset
+      const firstEp = parseInt(od.Episodes[0].Episode,10);
+      const localMin = haveSet.size>0 ? Math.min(...haveSet) : 1;
+      const offset  = (firstEp > 1 && localMin < firstEp/2) ? firstEp - 1 : 0;
+      allEps = od.Episodes.map(e=>({num:parseInt(e.Episode,10)-offset, title:e.Title}));
+    } else if(haveSet.size>0){
+      allEps = Array.from({length:s.max-s.min+1},(_,i)=>({num:s.min+i}));
+    }
+    if(isAnime&&!od){
+      allEps=Array.from(haveSet).sort((a,b)=>a-b).map(n=>({num:n}));
+    }
+    return{season:sNum,have:haveSet,allEps,missing:allEps.filter(e=>!haveSet.has(e.num))};
   }) : [];
 
   const totalMissing = seasonDetails.reduce((s,x)=>s+x.missing.length,0);
@@ -694,7 +787,8 @@ const DetailPanel = ({ item, type, overrides, onClose, onEnrich, onEnrichAnime, 
 
           {/* Manual ID */}
           <ManualIdPanel itemKey={itemKey} overrides={overrides} onSave={onSaveOverride}
-            onClear={onClearOverride} onFetch={onFetchById} apiKey={apiKey} type={type}/>
+            onClear={onClearOverride} onFetch={onFetchById} apiKey={apiKey} type={type}
+            omdb={o} onEnrichAnime={onEnrichAnime}/>
 
           {/* Season breakdown */}
           {isShow&&seasonDetails.length>0&&(
@@ -886,7 +980,11 @@ export default function App() {
           let omdbData=c[ck]||(ovrEntry?c[ovrEntry.imdbId]:null);
           if(!omdbData)return show;
           const seasonData={};
-          for(const s of (show.seasons||[])){const sk=`${omdbData.imdbID}:${s.season}`;if(sc[sk])seasonData[s.season]=sc[sk];}
+          const totalSC=parseInt(omdbData?.totalSeasons)||0;
+          const localSnC=new Set((show.seasons||[]).map(x=>x.season));
+          const allSnC=[...localSnC];
+          for(let i=1;i<=totalSC;i++){if(!localSnC.has(i))allSnC.push(i);}
+          for(const sn of allSnC){const sk=`${omdbData.imdbID}:${sn}`;if(sc[sk])seasonData[sn]=sc[sk];}
           return{...show,omdb:{...omdbData,seasonData},omdbStatus:"done"};
         });
         const enrichedMovies=d.movies.map(movie=>{
@@ -919,11 +1017,15 @@ export default function App() {
       if(type==="series"){
         const show=shows.find(s=>s.name===key);
         const seasonData={};
-        for(const s of(show?.seasons||[])){
-          const sk=`${imdbId}:${s.season}`;
+        const localSnums=new Set((show?.seasons||[]).map(x=>x.season));
+        const totalS=parseInt(data?.totalSeasons)||0;
+        const allSnums=[...localSnums];
+        for(let i=1;i<=totalS;i++){if(!localSnums.has(i))allSnums.push(i);}
+        for(const sNum of allSnums){
+          const sk=`${imdbId}:${sNum}`;
           let sd=await db.getSeason(sk);
-          if(!sd){await sleep(150);sd=await omdbGet({i:imdbId,Season:s.season},apiKey);setReqCount(c=>c+1);if(sd)await db.saveSeason(sk,sd);}
-          if(sd)seasonData[s.season]=sd;
+          if(!sd){await sleep(150);sd=await omdbGet({i:imdbId,Season:sNum},apiKey);setReqCount(c=>c+1);if(sd)await db.saveSeason(sk,sd);}
+          if(sd)seasonData[sNum]=sd;
         }
         setShows(prev=>prev.map(s=>s.name===key?{...s,omdb:{...data,seasonData},omdbStatus:"done"}:s));
       } else {
@@ -1201,7 +1303,7 @@ export default function App() {
       <style>{css}</style>
       <div className="app">
         <div className="hdr">
-          <h1><em>$</em> rclone<em>::</em>media-vault <span style={{fontSize:".6em",opacity:.4}}>v2</span></h1>
+          <h1><em>$</em> rclone<em>::</em>media-vault <span style={{fontSize:".6em",opacity:.4}}>v2</span><span style={{fontFamily:"IBM Plex Mono",fontSize:".6em",color:"var(--green)",marginLeft:8,opacity:.8}}>build {BUILD}</span></h1>
           <span className="hdr-sub">gdrive · omdb · anilist</span>
           <div className="hdr-right">
             {/* Theme switcher */}
